@@ -89,8 +89,8 @@ async function proxyCall(payload) {
 async function callClaude(prompt, system = '') {
   const data = await proxyCall({
     action: 'claude',
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 800,
+    model: 'claude-sonnet-4-20250514',
+    max_tokens: 4000,
     messages: [{ role: 'user', content: prompt }],
     system,
   });
@@ -128,13 +128,21 @@ async function fetchBookByISBN(isbn) {
 
 // ── AI recipe extraction ───────────────────────────────────────────────────
 async function extractRecipesAI(book) {
-  // Ultra-short prompt to stay well under Netlify free tier 10s timeout
-  const system = `JSON array only. No markdown.`;
-  const prompt = `5 recipes from "${book.title}" by ${book.author}. Format: [{"name":"...","page":1,"category":"Desserts"}]. Categories: Breakfast,Appetizers,Soups & Salads,Mains,Sides,Desserts,Baking,Drinks,Snacks,Other.`;
+  const system = `You are a culinary database assistant. Return ONLY valid JSON — no markdown, no backticks, no explanation.`;
+  const prompt = `List the recipes from the cookbook "${book.title}" by ${book.author} (ISBN: ${book.isbn}).
+
+Return a JSON array. Each element must have:
+- "name": string
+- "page": integer (estimate if unsure)
+- "category": one of ["Breakfast","Appetizers","Soups & Salads","Mains","Sides","Desserts","Baking","Drinks","Snacks","Other"]
+- "description": one sentence description
+
+Include all major recipes from the book — aim for 25-40. If the exact book is unknown, generate a realistic and comprehensive list based on the title and author's style.
+
+Return ONLY the JSON array, nothing else.`;
 
   const raw = await callClaude(prompt, system);
   const clean = raw.replace(/```json|```/g, '').trim();
-  // Find the JSON array even if there's surrounding text
   const match = clean.match(/\[[\s\S]*\]/);
   if (!match) throw new Error('No JSON array in response');
   const parsed = JSON.parse(match[0]);
@@ -144,7 +152,7 @@ async function extractRecipesAI(book) {
     name: r.name || 'Unnamed Recipe',
     page: Number(r.page) || 0,
     category: r.category || 'Other',
-    description: '',
+    description: r.description || '',
     notes: '',
     rating: 0,
     difficulty: '',
@@ -292,6 +300,8 @@ function App() {
   const [difficultyDraft, setDifficultyDraft] = useState('');
   const [showInstallBanner, setShowInstallBanner] = useState(false);
   const [isOffline, setIsOffline] = useState(!navigator.onLine);
+  const [addingRecipe, setAddingRecipe] = useState(false);
+  const [newRecipe, setNewRecipe] = useState({ name: '', page: '', category: 'Mains' });
 
   const { installPrompt, install } = useInstallPrompt();
   const debouncedQuery = useDebounce(searchQuery, 200);
@@ -400,6 +410,50 @@ function App() {
     const updated = { ...library, recipes: library.recipes.map((r) => r.id === selectedRecipe.id ? { ...r, madeDates: [...(r.madeDates || []), today] } : r) };
     setSelectedRecipe(updated.recipes.find((r) => r.id === selectedRecipe.id));
     persistLibrary(updated);
+  };
+
+  const saveNewRecipe = () => {
+    if (!newRecipe.name.trim() || !selectedRecipe) return;
+    const book = getBook(selectedRecipe.bookId);
+    if (!book) return;
+    const recipe = {
+      id: `${book.id}-manual-${Date.now()}`,
+      bookId: book.id,
+      name: newRecipe.name.trim(),
+      page: Number(newRecipe.page) || 0,
+      category: newRecipe.category || 'Other',
+      description: '',
+      notes: '',
+      rating: 0,
+      difficulty: '',
+      madeDates: [],
+      addedAt: new Date().toISOString(),
+    };
+    const updated = { ...library, recipes: [...library.recipes, recipe] };
+    persistLibrary(updated);
+    setNewRecipe({ name: '', page: '', category: 'Mains' });
+    setAddingRecipe(false);
+  };
+
+  const saveNewRecipeToBook = (bookId) => {
+    if (!newRecipe.name.trim()) return;
+    const recipe = {
+      id: `${bookId}-manual-${Date.now()}`,
+      bookId,
+      name: newRecipe.name.trim(),
+      page: Number(newRecipe.page) || 0,
+      category: newRecipe.category || 'Other',
+      description: '',
+      notes: '',
+      rating: 0,
+      difficulty: '',
+      madeDates: [],
+      addedAt: new Date().toISOString(),
+    };
+    const updated = { ...library, recipes: [...library.recipes, recipe] };
+    persistLibrary(updated);
+    setNewRecipe({ name: '', page: '', category: 'Mains' });
+    setAddingRecipe(false);
   };
 
   const deleteBook = (bookId) => {
@@ -635,7 +689,65 @@ function App() {
                   )}
                 </div>
               </div>
+
+              <hr className="section-divider" />
+
+              {/* Add Recipe to same book */}
+              <div>
+                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+                  <div className="notes-section-title">Add a Recipe</div>
+                  {!addingRecipe && (
+                    <button className="btn-secondary" onClick={() => setAddingRecipe(true)}>+ Add Recipe</button>
+                  )}
+                </div>
+                {addingRecipe ? (
+                  <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                    <input
+                      className="isbn-input"
+                      style={{ letterSpacing: 0, fontSize: 16, marginBottom: 0 }}
+                      placeholder="Recipe name"
+                      value={newRecipe.name}
+                      onChange={e => setNewRecipe(r => ({ ...r, name: e.target.value }))}
+                    />
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <input
+                        className="isbn-input"
+                        style={{ letterSpacing: 0, fontSize: 16, marginBottom: 0, width: 100 }}
+                        placeholder="Page #"
+                        value={newRecipe.page}
+                        onChange={e => setNewRecipe(r => ({ ...r, page: e.target.value }))}
+                        inputMode="numeric"
+                        type="text"
+                      />
+                      <select
+                        className="difficulty-select"
+                        style={{ flex: 1 }}
+                        value={newRecipe.category}
+                        onChange={e => setNewRecipe(r => ({ ...r, category: e.target.value }))}
+                      >
+                        {['Breakfast','Appetizers','Soups & Salads','Mains','Sides','Desserts','Baking','Drinks','Snacks','Other'].map(c => (
+                          <option key={c}>{c}</option>
+                        ))}
+                      </select>
+                    </div>
+                    <div style={{ display: 'flex', gap: 8 }}>
+                      <button
+                        className="btn-primary"
+                        style={{ width: 'auto', padding: '9px 22px' }}
+                        onClick={() => saveNewRecipeToBook(selectedRecipe.bookId)}
+                        disabled={!newRecipe.name.trim()}
+                      >Save Recipe</button>
+                      <button className="btn-secondary" onClick={() => { setAddingRecipe(false); setNewRecipe({ name: '', page: '', category: 'Mains' }); }}>Cancel</button>
+                    </div>
+                  </div>
+                ) : (
+                  <div style={{ fontSize: 14, color: '#b0a090', fontStyle: 'italic' }}>
+                    Missing a recipe from this book? Add it manually here.
+                  </div>
+                )}
+              </div>
             </div>
+          </div>
           );
         })()}
 
@@ -687,7 +799,12 @@ function App() {
                           <div className="library-book-author">{book.author}</div>
                           <div className="library-book-count">{library.recipes.filter(r => r.bookId === book.id).length} recipes</div>
                         </div>
-                        <button className="btn-danger" style={{ marginTop: 6, width: '100%', fontSize: 12, padding: '4px 0' }} onClick={() => deleteBook(book.id)}>Remove</button>
+                        <button
+                          className="btn-secondary"
+                          style={{ marginTop: 6, width: '100%', fontSize: 12, padding: '4px 0' }}
+                          onClick={() => { setAddingRecipe(true); setNewRecipe({ name: '', page: '', category: 'Mains' }); setFilterBook(book.id); setView('search'); }}
+                        >+ Recipe</button>
+                        <button className="btn-danger" style={{ marginTop: 4, width: '100%', fontSize: 12, padding: '4px 0' }} onClick={() => deleteBook(book.id)}>Remove</button>
                       </div>
                     ))}
                   </div>
