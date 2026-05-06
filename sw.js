@@ -1,7 +1,7 @@
 // Shelf & Spoon — Service Worker
 // Strategy: Cache-first for assets, network-first for API calls
 
-const CACHE_VERSION = 'shelf-spoon-v1';
+const CACHE_VERSION = 'shelf-spoon-v2';
 const STATIC_CACHE = `${CACHE_VERSION}-static`;
 const CDN_CACHE = `${CACHE_VERSION}-cdn`;
 
