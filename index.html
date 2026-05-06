@@ -24,6 +24,7 @@
     #splash-logo { font-family: 'Playfair Display', serif; font-size: 32px; color: #e8d5b7; display: flex; align-items: center; gap: 12px; }
     #splash-sub { color: #a08060; font-size: 15px; font-style: italic; margin-top: 8px; }
     #splash-spinner { width: 28px; height: 28px; border: 2px solid #c8753a; border-top-color: transparent; border-radius: 50%; animation: spin 0.7s linear infinite; margin-top: 36px; }
+    #splash-error { display: none; color: #c8753a; font-size: 13px; margin-top: 20px; text-align: center; max-width: 280px; line-height: 1.5; }
     @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 </head>
@@ -32,6 +33,7 @@
     <div id="splash-logo">📚 Shelf &amp; Spoon</div>
     <div id="splash-sub">Your personal recipe library</div>
     <div id="splash-spinner"></div>
+    <div id="splash-error">Taking too long? Try a hard refresh (Ctrl+Shift+R) or clear your browser cache.</div>
   </div>
   <div id="root"></div>
 
@@ -40,9 +42,26 @@
   <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
 
   <script>
+    // Unregister old service workers and re-register fresh
     if ('serviceWorker' in navigator) {
-      window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
+      window.addEventListener('load', () => {
+        // Unregister all existing service workers first to clear stale cache
+        navigator.serviceWorker.getRegistrations().then(regs => {
+          regs.forEach(reg => reg.unregister());
+        }).then(() => {
+          navigator.serviceWorker.register('/sw.js').catch(() => {});
+        });
+      });
     }
+
+    // Show error hint if splash screen is still showing after 8 seconds
+    setTimeout(() => {
+      const splash = document.getElementById('splash');
+      const err = document.getElementById('splash-error');
+      if (splash && !splash.classList.contains('hidden') && err) {
+        err.style.display = 'block';
+      }
+    }, 8000);
   </script>
 
   <script type="text/babel">
