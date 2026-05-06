@@ -1,0 +1,816 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
+  <meta name="theme-color" content="#2a1f14" />
+  <meta name="description" content="Search recipes across all your cookbooks" />
+  <meta name="apple-mobile-web-app-capable" content="yes" />
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+  <meta name="apple-mobile-web-app-title" content="Shelf & Spoon" />
+  <link rel="manifest" href="/manifest.json" />
+  <link rel="apple-touch-icon" href="/icons/icon-192.png" />
+  <link rel="icon" type="image/png" sizes="32x32" href="/icons/icon-32.png" />
+  <title>Shelf & Spoon</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=Crimson+Pro:ital,wght@0,300;0,400;0,600;1,300;1,400&display=swap" rel="stylesheet" />
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body, #root { height: 100%; }
+    body { background: #f5f0e8; font-family: 'Crimson Pro', Georgia, serif; color: #2a1f14; -webkit-font-smoothing: antialiased; overscroll-behavior: none; }
+    #splash { position: fixed; inset: 0; background: #2a1f14; display: flex; flex-direction: column; align-items: center; justify-content: center; z-index: 9999; transition: opacity 0.4s ease; }
+    #splash.hidden { opacity: 0; pointer-events: none; }
+    #splash-logo { font-family: 'Playfair Display', serif; font-size: 32px; color: #e8d5b7; display: flex; align-items: center; gap: 12px; }
+    #splash-sub { color: #a08060; font-size: 15px; font-style: italic; margin-top: 8px; }
+    #splash-spinner { width: 28px; height: 28px; border: 2px solid #c8753a; border-top-color: transparent; border-radius: 50%; animation: spin 0.7s linear infinite; margin-top: 36px; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+<body>
+  <div id="splash">
+    <div id="splash-logo">📚 Shelf &amp; Spoon</div>
+    <div id="splash-sub">Your personal recipe library</div>
+    <div id="splash-spinner"></div>
+  </div>
+  <div id="root"></div>
+
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => navigator.serviceWorker.register('/sw.js').catch(() => {}));
+    }
+  </script>
+
+  <script type="text/babel">
+// Shelf & Spoon — app.jsx
+// Loaded via Babel standalone (no build step required)
+
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ── Storage helpers (localStorage for PWA offline support) ─────────────────
+// Falls back gracefully if storage unavailable
+const STORAGE_KEY = 'shelf-spoon-library-v1';
+
+function loadLibrary() {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    return raw ? JSON.parse(raw) : { books: [], recipes: [] };
+  } catch {
+    return { books: [], recipes: [] };
+  }
+}
+
+function saveLibrary(data) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  } catch (e) {
+    console.warn('Storage quota exceeded:', e);
+  }
+}
+
+// ── All API calls routed via Netlify function (fixes iOS WebKit CORS) ───────
+async function proxyCall(payload) {
+  const res = await fetch('/.netlify/functions/claude', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const errText = await res.text().catch(() => String(res.status));
+    throw new Error(`HTTP ${res.status}: ${errText}`);
+  }
+  return res.json();
+}
+
+async function callClaude(prompt, system = '') {
+  const data = await proxyCall({
+    action: 'claude',
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 800,
+    messages: [{ role: 'user', content: prompt }],
+    system,
+  });
+  if (data.error) throw new Error(data.error + (data.detail ? ': ' + data.detail : ''));
+  return data.content?.[0]?.text || '';
+}
+
+// ── Open Library ISBN lookup (via proxy) ──────────────────────────────────
+async function fetchBookByISBN(isbn) {
+  const clean = isbn.replace(/[^0-9Xx]/g, '');
+  const data = await proxyCall({ action: 'isbn_lookup', isbn: clean });
+  const key = `ISBN:${clean}`;
+  const book = data[key];
+  if (!book) return null;
+
+  // Extract cover ID number from Open Library URL
+  let coverId = null;
+  const coverUrl = book.cover?.large || book.cover?.medium || book.cover?.small;
+  if (coverUrl) {
+    const match = coverUrl.match(/\/(\d+)-/);
+    coverId = match ? match[1] : null;
+  }
+
+  return {
+    id: `book-${Date.now()}`,
+    isbn: clean,
+    title: book.title || 'Unknown Title',
+    author: book.authors?.map((a) => a.name).join(', ') || 'Unknown Author',
+    coverId,
+    year: book.publish_date || '',
+    publisher: book.publishers?.[0]?.name || '',
+    addedAt: new Date().toISOString(),
+  };
+}
+
+// ── AI recipe extraction ───────────────────────────────────────────────────
+async function extractRecipesAI(book) {
+  // Ultra-short prompt to stay well under Netlify free tier 10s timeout
+  const system = `JSON array only. No markdown.`;
+  const prompt = `5 recipes from "${book.title}" by ${book.author}. Format: [{"name":"...","page":1,"category":"Desserts"}]. Categories: Breakfast,Appetizers,Soups & Salads,Mains,Sides,Desserts,Baking,Drinks,Snacks,Other.`;
+
+  const raw = await callClaude(prompt, system);
+  const clean = raw.replace(/```json|```/g, '').trim();
+  // Find the JSON array even if there's surrounding text
+  const match = clean.match(/\[[\s\S]*\]/);
+  if (!match) throw new Error('No JSON array in response');
+  const parsed = JSON.parse(match[0]);
+  return parsed.map((r, i) => ({
+    id: `${book.id}-r${i}`,
+    bookId: book.id,
+    name: r.name || 'Unnamed Recipe',
+    page: Number(r.page) || 0,
+    category: r.category || 'Other',
+    description: '',
+    notes: '',
+    rating: 0,
+    difficulty: '',
+    madeDates: [],
+    addedAt: new Date().toISOString(),
+  }));
+}
+
+// ── Debounce hook ──────────────────────────────────────────────────────────
+function useDebounce(value, delay) {
+  const [dv, setDv] = useState(value);
+  useEffect(() => {
+    const t = setTimeout(() => setDv(value), delay);
+    return () => clearTimeout(t);
+  }, [value, delay]);
+  return dv;
+}
+
+// ── PWA install prompt hook ────────────────────────────────────────────────
+function useInstallPrompt() {
+  const [prompt, setPrompt] = useState(null);
+  useEffect(() => {
+    const handler = (e) => { e.preventDefault(); setPrompt(e); };
+    window.addEventListener('beforeinstallprompt', handler);
+    return () => window.removeEventListener('beforeinstallprompt', handler);
+  }, []);
+  const install = useCallback(() => {
+    if (!prompt) return;
+    prompt.prompt();
+    prompt.userChoice.finally(() => setPrompt(null));
+  }, [prompt]);
+  return { installPrompt: prompt, install };
+}
+
+// ── Components ─────────────────────────────────────────────────────────────
+
+function StarRating({ value, onChange, readonly = false }) {
+  const [hover, setHover] = useState(0);
+  return (
+    <div style={{ display: 'flex', gap: 2 }}>
+      {[1, 2, 3, 4, 5].map((s) => (
+        <span
+          key={s}
+          onClick={() => !readonly && onChange(s === value ? 0 : s)}
+          onMouseEnter={() => !readonly && setHover(s)}
+          onMouseLeave={() => !readonly && setHover(0)}
+          style={{
+            cursor: readonly ? 'default' : 'pointer',
+            fontSize: 20,
+            color: s <= (hover || value) ? '#c8753a' : '#d4c5b0',
+            transition: 'color 0.15s',
+            userSelect: 'none',
+            WebkitUserSelect: 'none',
+          }}
+        >★</span>
+      ))}
+    </div>
+  );
+}
+
+function BookCover({ book, size = 60 }) {
+  const [failed, setFailed] = useState(false);
+  const src = book.coverId && !failed
+    ? `https://covers.openlibrary.org/b/id/${book.coverId}-M.jpg`
+    : null;
+
+  if (!src) {
+    return (
+      <div style={{
+        width: size, height: Math.round(size * 1.35),
+        background: 'linear-gradient(135deg, #3d2b1f 0%, #6b4226 100%)',
+        borderRadius: 4, display: 'flex', alignItems: 'center',
+        justifyContent: 'center', fontSize: Math.round(size * 0.32),
+        flexShrink: 0, boxShadow: '2px 3px 8px rgba(0,0,0,0.3)',
+      }}>📖</div>
+    );
+  }
+  return (
+    <img
+      src={src}
+      alt={book.title}
+      onError={() => setFailed(true)}
+      style={{
+        width: size, height: Math.round(size * 1.35),
+        objectFit: 'cover', borderRadius: 4,
+        flexShrink: 0, boxShadow: '2px 3px 8px rgba(0,0,0,0.3)',
+      }}
+    />
+  );
+}
+
+function Spinner({ size = 16, color = '#c8753a' }) {
+  return (
+    <span style={{
+      display: 'inline-block', width: size, height: size,
+      border: `2px solid ${color}`, borderTopColor: 'transparent',
+      borderRadius: '50%', animation: 'spin 0.7s linear infinite',
+      verticalAlign: 'middle', marginRight: 8, flexShrink: 0,
+    }} />
+  );
+}
+
+// ── Install Banner ─────────────────────────────────────────────────────────
+function InstallBanner({ onInstall, onDismiss }) {
+  return (
+    <div style={{
+      position: 'fixed', bottom: 16, left: '50%', transform: 'translateX(-50%)',
+      background: '#2a1f14', color: '#e8d5b7', borderRadius: 12,
+      padding: '14px 20px', display: 'flex', alignItems: 'center',
+      gap: 16, boxShadow: '0 8px 32px rgba(0,0,0,0.4)',
+      zIndex: 1000, maxWidth: 'calc(100vw - 32px)', width: 420,
+      fontFamily: "'Crimson Pro', Georgia, serif",
+    }}>
+      <span style={{ fontSize: 24 }}>📚</span>
+      <div style={{ flex: 1 }}>
+        <div style={{ fontFamily: "'Playfair Display', serif", fontSize: 15 }}>Add to Home Screen</div>
+        <div style={{ fontSize: 13, color: '#a08060', marginTop: 2 }}>Access your recipe library offline</div>
+      </div>
+      <button onClick={onInstall} style={{
+        background: '#c8753a', color: '#fff', border: 'none',
+        borderRadius: 8, padding: '8px 16px', cursor: 'pointer',
+        fontFamily: "'Crimson Pro', serif", fontSize: 14, whiteSpace: 'nowrap',
+      }}>Install</button>
+      <button onClick={onDismiss} style={{
+        background: 'none', border: 'none', color: '#a08060',
+        cursor: 'pointer', fontSize: 18, padding: 4,
+      }}>×</button>
+    </div>
+  );
+}
+
+// ── Main App ───────────────────────────────────────────────────────────────
+function App() {
+  const [library, setLibrary] = useState(() => loadLibrary());
+  const [view, setView] = useState('search');
+  const [searchQuery, setSearchQuery] = useState('');
+  const [selectedRecipe, setSelectedRecipe] = useState(null);
+  const [isbnInput, setIsbnInput] = useState('');
+  const [addStatus, setAddStatus] = useState('idle');
+  const [addMessage, setAddMessage] = useState('');
+  const [filterCategory, setFilterCategory] = useState('All');
+  const [filterBook, setFilterBook] = useState('All');
+  const [editingNotes, setEditingNotes] = useState(false);
+  const [noteDraft, setNoteDraft] = useState('');
+  const [difficultyDraft, setDifficultyDraft] = useState('');
+  const [showInstallBanner, setShowInstallBanner] = useState(false);
+  const [isOffline, setIsOffline] = useState(!navigator.onLine);
+
+  const { installPrompt, install } = useInstallPrompt();
+  const debouncedQuery = useDebounce(searchQuery, 200);
+
+  // Dismiss splash
+  useEffect(() => {
+    const splash = document.getElementById('splash');
+    if (splash) {
+      setTimeout(() => splash.classList.add('hidden'), 300);
+      setTimeout(() => splash.remove(), 750);
+    }
+  }, []);
+
+  // Handle URL params for shortcuts
+  useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const v = params.get('view');
+    if (v === 'add') setView('add');
+  }, []);
+
+  // Online/offline banner
+  useEffect(() => {
+    const onOnline = () => setIsOffline(false);
+    const onOffline = () => setIsOffline(true);
+    window.addEventListener('online', onOnline);
+    window.addEventListener('offline', onOffline);
+    return () => { window.removeEventListener('online', onOnline); window.removeEventListener('offline', onOffline); };
+  }, []);
+
+  // Show install banner after 30s if prompt available
+  useEffect(() => {
+    if (installPrompt) {
+      const t = setTimeout(() => setShowInstallBanner(true), 30000);
+      return () => clearTimeout(t);
+    }
+  }, [installPrompt]);
+
+  const persistLibrary = (updated) => {
+    setLibrary(updated);
+    saveLibrary(updated);
+  };
+
+  const getBook = (bookId) => library.books.find((b) => b.id === bookId);
+
+  const categories = ['All','Breakfast','Appetizers','Soups & Salads','Mains','Sides','Desserts','Baking','Drinks','Snacks','Other'];
+
+  // Search results
+  const results = (() => {
+    let list = library.recipes;
+    if (filterCategory !== 'All') list = list.filter((r) => r.category === filterCategory);
+    if (filterBook !== 'All') list = list.filter((r) => r.bookId === filterBook);
+    if (debouncedQuery.trim()) {
+      const q = debouncedQuery.toLowerCase();
+      list = list.filter((r) =>
+        r.name.toLowerCase().includes(q) ||
+        r.description.toLowerCase().includes(q) ||
+        r.category.toLowerCase().includes(q) ||
+        (getBook(r.bookId)?.title || '').toLowerCase().includes(q)
+      );
+    }
+    return list;
+  })();
+
+  // Add book
+  const handleAddBook = async () => {
+    if (!isbnInput.trim()) return;
+    if (isOffline) { setAddStatus('error'); setAddMessage('You\'re offline. Connect to the internet to add new books.'); return; }
+    setAddStatus('fetching'); setAddMessage('Looking up book metadata…');
+    try {
+      const book = await fetchBookByISBN(isbnInput.trim());
+      if (!book) { setAddStatus('error'); setAddMessage('ISBN not found. Double-check the number and try again.'); return; }
+      if (library.books.find((b) => b.isbn === book.isbn)) { setAddStatus('error'); setAddMessage('This cookbook is already in your library.'); return; }
+      setAddMessage(`Found "${book.title}". Extracting recipes with AI…`); setAddStatus('extracting');
+      const recipes = await extractRecipesAI(book);
+      const updated = { books: [...library.books, book], recipes: [...library.recipes, ...recipes] };
+      persistLibrary(updated);
+      setAddStatus('done'); setAddMessage(`✓ Added "${book.title}" with ${recipes.length} recipes.`);
+      setIsbnInput('');
+      setTimeout(() => { setAddStatus('idle'); setAddMessage(''); setView('search'); }, 2500);
+    } catch (e) {
+      setAddStatus('error'); setAddMessage('Something went wrong: ' + e.message);
+    }
+  };
+
+  const saveNotes = () => {
+    const updated = {
+      ...library,
+      recipes: library.recipes.map((r) =>
+        r.id === selectedRecipe.id ? { ...r, notes: noteDraft, difficulty: difficultyDraft } : r
+      ),
+    };
+    const updatedRecipe = updated.recipes.find((r) => r.id === selectedRecipe.id);
+    setSelectedRecipe(updatedRecipe);
+    persistLibrary(updated);
+    setEditingNotes(false);
+  };
+
+  const saveRating = (rating) => {
+    const updated = { ...library, recipes: library.recipes.map((r) => r.id === selectedRecipe.id ? { ...r, rating } : r) };
+    setSelectedRecipe(updated.recipes.find((r) => r.id === selectedRecipe.id));
+    persistLibrary(updated);
+  };
+
+  const markMade = () => {
+    const today = new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+    const updated = { ...library, recipes: library.recipes.map((r) => r.id === selectedRecipe.id ? { ...r, madeDates: [...(r.madeDates || []), today] } : r) };
+    setSelectedRecipe(updated.recipes.find((r) => r.id === selectedRecipe.id));
+    persistLibrary(updated);
+  };
+
+  const deleteBook = (bookId) => {
+    if (!confirm('Remove this cookbook and all its recipes from your library?')) return;
+    const updated = { books: library.books.filter((b) => b.id !== bookId), recipes: library.recipes.filter((r) => r.bookId !== bookId) };
+    persistLibrary(updated);
+  };
+
+  // ── Styles (injected once) ──────────────────────────────────────────────
+  return (
+    <>
+      <style>{`
+        @keyframes spin { to { transform: rotate(360deg); } }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+
+        .app { min-height: 100vh; background: #f5f0e8; background-image: radial-gradient(ellipse at 20% 0%, rgba(200,117,58,0.08) 0%, transparent 50%), radial-gradient(ellipse at 80% 100%, rgba(61,43,31,0.06) 0%, transparent 50%); }
+
+        .header { background: #2a1f14; padding: 0 24px; display: flex; align-items: center; justify-content: space-between; height: 60px; position: sticky; top: 0; z-index: 100; box-shadow: 0 2px 20px rgba(0,0,0,0.3); }
+        .logo { font-family: 'Playfair Display', serif; font-size: 20px; color: #e8d5b7; letter-spacing: 0.5px; display: flex; align-items: center; gap: 10px; white-space: nowrap; }
+        .nav { display: flex; gap: 4px; }
+        .nav-btn { background: none; border: none; color: #a08060; font-family: 'Crimson Pro', serif; font-size: 15px; padding: 7px 14px; border-radius: 6px; cursor: pointer; transition: all 0.2s; white-space: nowrap; }
+        .nav-btn:hover { color: #e8d5b7; background: rgba(255,255,255,0.06); }
+        .nav-btn.active { color: #c8753a; background: rgba(200,117,58,0.12); }
+
+        .content { max-width: 1100px; margin: 0 auto; padding: 28px 16px 80px; }
+
+        .offline-bar { background: #5a3020; color: #f0d0b0; text-align: center; padding: 8px; font-size: 14px; font-style: italic; }
+
+        .search-hero { text-align: center; padding: 36px 0 28px; }
+        .search-title { font-family: 'Playfair Display', serif; font-size: clamp(28px, 6vw, 42px); color: #2a1f14; font-weight: 400; margin-bottom: 6px; line-height: 1.2; }
+        .search-sub { font-size: 17px; color: #7a6045; font-style: italic; margin-bottom: 24px; font-weight: 300; }
+
+        .search-bar-wrap { max-width: 560px; margin: 0 auto; position: relative; }
+        .search-bar { width: 100%; background: #fff; border: 2px solid #d4c5b0; border-radius: 50px; padding: 13px 50px 13px 22px; font-family: 'Crimson Pro', serif; font-size: 18px; color: #2a1f14; outline: none; transition: border-color 0.2s, box-shadow 0.2s; box-shadow: 0 2px 12px rgba(0,0,0,0.06); -webkit-appearance: none; }
+        .search-bar:focus { border-color: #c8753a; box-shadow: 0 2px 20px rgba(200,117,58,0.15); }
+        .search-bar::placeholder { color: #b0a090; }
+        .search-icon { position: absolute; right: 18px; top: 50%; transform: translateY(-50%); font-size: 18px; opacity: 0.45; pointer-events: none; }
+
+        .stats-bar { display: flex; gap: 0; background: #fff; border: 1.5px solid #e8ddd0; border-radius: 12px; padding: 0; margin-bottom: 24px; overflow: hidden; }
+        .stat-item { flex: 1; text-align: center; padding: 14px 8px; border-right: 1px solid #e8ddd0; }
+        .stat-item:last-child { border-right: none; }
+        .stat-num { font-family: 'Playfair Display', serif; font-size: 24px; color: #c8753a; }
+        .stat-label { font-size: 12px; color: #9a8060; font-style: italic; margin-top: 2px; }
+
+        .filters { display: flex; gap: 6px; flex-wrap: wrap; margin: 20px 0 16px; align-items: center; }
+        .filter-label { font-size: 13px; color: #7a6045; font-style: italic; }
+        .filter-chip { background: #fff; border: 1.5px solid #d4c5b0; border-radius: 50px; padding: 5px 13px; font-family: 'Crimson Pro', serif; font-size: 14px; color: #5a4030; cursor: pointer; transition: all 0.15s; white-space: nowrap; }
+        .filter-chip:hover { border-color: #c8753a; color: #c8753a; }
+        .filter-chip.active { background: #c8753a; border-color: #c8753a; color: #fff; }
+        .filter-select { background: #fff; border: 1.5px solid #d4c5b0; border-radius: 50px; padding: 5px 14px; font-family: 'Crimson Pro', serif; font-size: 14px; color: #5a4030; cursor: pointer; outline: none; -webkit-appearance: none; appearance: none; padding-right: 24px; }
+
+        .results-count { font-size: 14px; color: #9a8060; font-style: italic; margin-bottom: 14px; }
+        .results-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; }
+        .recipe-card { background: #fff; border-radius: 12px; padding: 16px; cursor: pointer; transition: all 0.2s; border: 1.5px solid #e8ddd0; display: flex; gap: 14px; align-items: flex-start; box-shadow: 0 1px 4px rgba(0,0,0,0.04); animation: fadeIn 0.25s ease; }
+        .recipe-card:hover { border-color: #c8753a; box-shadow: 0 4px 20px rgba(200,117,58,0.12); transform: translateY(-1px); }
+        .recipe-card:active { transform: translateY(0); }
+        .recipe-card-body { flex: 1; min-width: 0; }
+        .recipe-name { font-family: 'Playfair Display', serif; font-size: 16px; color: #2a1f14; margin-bottom: 4px; line-height: 1.3; }
+        .recipe-desc { font-size: 13px; color: #7a6045; line-height: 1.5; margin-bottom: 8px; font-weight: 300; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+        .recipe-meta { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+        .recipe-book { font-size: 12px; color: #c8753a; font-style: italic; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 160px; }
+        .recipe-page { font-size: 12px; color: #9a8060; background: #f5f0e8; padding: 2px 8px; border-radius: 50px; white-space: nowrap; }
+        .recipe-category { font-size: 11px; color: #8a7060; background: #eee8dc; padding: 2px 8px; border-radius: 50px; text-transform: uppercase; letter-spacing: 0.5px; white-space: nowrap; }
+
+        .empty-state { text-align: center; padding: 60px 20px; color: #9a8060; }
+        .empty-icon { font-size: 44px; margin-bottom: 14px; }
+        .empty-title { font-family: 'Playfair Display', serif; font-size: 22px; color: #5a4030; margin-bottom: 8px; }
+        .empty-sub { font-size: 16px; font-style: italic; font-weight: 300; }
+
+        .add-panel { max-width: 500px; margin: 48px auto; background: #fff; border-radius: 16px; padding: 36px; border: 1.5px solid #e8ddd0; box-shadow: 0 4px 30px rgba(0,0,0,0.08); }
+        .add-title { font-family: 'Playfair Display', serif; font-size: 26px; color: #2a1f14; margin-bottom: 6px; }
+        .add-sub { font-size: 16px; color: #7a6045; font-style: italic; font-weight: 300; margin-bottom: 24px; }
+
+        .isbn-input { width: 100%; border: 2px solid #d4c5b0; border-radius: 10px; padding: 13px 16px; font-family: 'Crimson Pro', serif; font-size: 18px; color: #2a1f14; outline: none; letter-spacing: 2px; transition: border-color 0.2s; margin-bottom: 14px; -webkit-appearance: none; }
+        .isbn-input:focus { border-color: #c8753a; }
+        .isbn-input::placeholder { letter-spacing: 0; color: #b0a090; }
+
+        .btn-primary { background: #2a1f14; color: #e8d5b7; border: none; border-radius: 10px; padding: 13px 24px; font-family: 'Crimson Pro', serif; font-size: 16px; cursor: pointer; transition: all 0.2s; width: 100%; letter-spacing: 0.3px; display: flex; align-items: center; justify-content: center; -webkit-tap-highlight-color: transparent; }
+        .btn-primary:hover:not(:disabled) { background: #c8753a; color: #fff; }
+        .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-secondary { background: #f5f0e8; color: #5a4030; border: 1.5px solid #d4c5b0; border-radius: 8px; padding: 8px 16px; font-family: 'Crimson Pro', serif; font-size: 15px; cursor: pointer; transition: all 0.15s; -webkit-tap-highlight-color: transparent; }
+        .btn-secondary:hover { background: #e8ddd0; border-color: #c8753a; color: #c8753a; }
+        .btn-danger { background: none; color: #c84040; border: 1.5px solid #e0b0b0; border-radius: 8px; padding: 7px 14px; font-family: 'Crimson Pro', serif; font-size: 14px; cursor: pointer; transition: all 0.15s; }
+        .btn-danger:hover { background: #fdf0f0; }
+
+        .status-msg { margin-top: 14px; padding: 12px 16px; border-radius: 8px; font-size: 15px; line-height: 1.5; display: flex; align-items: flex-start; gap: 8px; }
+        .status-msg.fetching,.status-msg.extracting { background: #f5f0e8; color: #5a4030; border-left: 3px solid #c8753a; }
+        .status-msg.done { background: #f0f7f0; color: #2a5a2a; border-left: 3px solid #4a9a4a; }
+        .status-msg.error { background: #fdf0f0; color: #7a2a2a; border-left: 3px solid #c84040; }
+
+        .library-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 18px; margin-top: 24px; }
+        .library-book-card { cursor: pointer; transition: transform 0.2s; text-align: center; }
+        .library-book-card:hover { transform: translateY(-3px); }
+        .library-book-title { font-size: 13px; color: #2a1f14; margin-top: 8px; line-height: 1.3; font-family: 'Playfair Display', serif; }
+        .library-book-author { font-size: 11px; color: #9a8060; font-style: italic; margin-top: 2px; }
+        .library-book-count { font-size: 11px; color: #b0a090; margin-top: 2px; }
+
+        .detail-back { display: inline-flex; align-items: center; gap: 6px; color: #c8753a; cursor: pointer; font-size: 15px; margin-bottom: 20px; font-style: italic; transition: opacity 0.15s; -webkit-tap-highlight-color: transparent; }
+        .detail-back:hover { opacity: 0.7; }
+        .detail-panel { background: #fff; border-radius: 16px; padding: clamp(20px, 4vw, 36px); border: 1.5px solid #e8ddd0; box-shadow: 0 2px 20px rgba(0,0,0,0.06); }
+        .detail-header { display: flex; gap: 20px; margin-bottom: 24px; }
+        .detail-info { flex: 1; min-width: 0; }
+        .detail-recipe-name { font-family: 'Playfair Display', serif; font-size: clamp(22px, 5vw, 30px); color: #2a1f14; margin-bottom: 6px; line-height: 1.2; }
+        .detail-book-ref { font-size: 15px; color: #c8753a; font-style: italic; margin-bottom: 4px; }
+        .detail-page { font-size: 14px; color: #7a6045; margin-bottom: 12px; }
+        .detail-desc { font-size: 16px; color: #5a4030; line-height: 1.6; font-weight: 300; margin-bottom: 16px; }
+
+        .detail-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 24px; align-items: center; }
+        .badge { font-size: 11px; color: #8a7060; background: #eee8dc; padding: 4px 12px; border-radius: 50px; text-transform: uppercase; letter-spacing: 0.5px; }
+
+        .section-divider { border: none; border-top: 1px solid #e8ddd0; margin: 20px 0; }
+        .notes-section-title { font-family: 'Playfair Display', serif; font-size: 18px; color: #2a1f14; margin-bottom: 12px; }
+        .notes-display { background: #fdf9f4; border: 1.5px solid #e8ddd0; border-radius: 10px; padding: 16px; font-size: 16px; color: #5a4030; line-height: 1.6; min-height: 56px; font-weight: 300; white-space: pre-wrap; }
+        .notes-textarea { width: 100%; background: #fdf9f4; border: 2px solid #c8753a; border-radius: 10px; padding: 16px; font-family: 'Crimson Pro', serif; font-size: 16px; color: #2a1f14; line-height: 1.6; min-height: 110px; outline: none; resize: vertical; font-weight: 300; -webkit-appearance: none; }
+        .difficulty-select { background: #fff; border: 1.5px solid #d4c5b0; border-radius: 8px; padding: 8px 14px; font-family: 'Crimson Pro', serif; font-size: 15px; color: #5a4030; outline: none; cursor: pointer; margin-bottom: 12px; -webkit-appearance: none; }
+        .made-dates { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+        .made-date-tag { background: #f0f7f0; color: #3a6a3a; border: 1px solid #b0d0b0; border-radius: 50px; padding: 3px 12px; font-size: 13px; }
+        .photo-link { display: inline-flex; align-items: center; gap: 4px; font-size: 13px; color: #c8753a; text-decoration: none; font-style: italic; opacity: 0.85; margin-top: 4px; }
+        .photo-link:hover { opacity: 1; text-decoration: underline; }
+
+        .section-header { display: flex; justify-content: space-between; align-items: center; margin: 28px 0 4px; }
+        .section-title { font-family: 'Playfair Display', serif; font-size: 20px; color: #2a1f14; }
+
+        @media (max-width: 480px) {
+          .filters { gap: 5px; }
+          .results-grid { grid-template-columns: 1fr; }
+          .stats-bar { flex-wrap: wrap; }
+          .stat-item { min-width: 50%; }
+          .detail-header { flex-direction: column; }
+        }
+      `}</style>
+
+      <div className="app">
+        {/* Offline bar */}
+        {isOffline && (
+          <div className="offline-bar">📵 You're offline — your saved library is still available</div>
+        )}
+
+        {/* Header */}
+        <header className="header">
+          <div className="logo">📚 Shelf &amp; Spoon</div>
+          <nav className="nav">
+            <button className={`nav-btn ${view === 'search' ? 'active' : ''}`} onClick={() => setView('search')}>Search</button>
+            <button className={`nav-btn ${view === 'add' ? 'active' : ''}`} onClick={() => setView('add')}>+ Add Book</button>
+          </nav>
+        </header>
+
+        {/* ── DETAIL VIEW ───────────────────────────────────────────── */}
+        {view === 'detail' && selectedRecipe && (() => {
+          const book = getBook(selectedRecipe.bookId);
+          return (
+            <div className="content">
+              <div className="detail-back" onClick={() => setView('search')}>← Back to results</div>
+              <div className="detail-panel">
+                <div className="detail-header">
+                  {book && <BookCover book={book} size={72} />}
+                  <div className="detail-info">
+                    <div className="detail-recipe-name">{selectedRecipe.name}</div>
+                    {book && <div className="detail-book-ref">{book.title}{book.author ? ` · ${book.author}` : ''}</div>}
+                    <div className="detail-page">Page {selectedRecipe.page}</div>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
+                      <StarRating value={selectedRecipe.rating || 0} onChange={saveRating} />
+                      <span style={{ fontSize: 13, color: '#9a8060', fontStyle: 'italic' }}>
+                        {selectedRecipe.rating ? `${selectedRecipe.rating}/5` : 'Rate this'}
+                      </span>
+                    </div>
+                  </div>
+                </div>
+
+                <p className="detail-desc">{selectedRecipe.description}</p>
+                <a
+                  className="photo-link"
+                  href={`https://www.google.com/search?q=${encodeURIComponent(selectedRecipe.name + ' food')}&tbm=isch`}
+                  target="_blank" rel="noopener noreferrer"
+                >🔍 View food photos</a>
+
+                <div className="detail-actions" style={{ marginTop: 16 }}>
+                  <button className="btn-secondary" onClick={markMade}>✓ Mark as Made Today</button>
+                  <span className="badge">{selectedRecipe.category}</span>
+                  {selectedRecipe.difficulty && <span className="badge">{selectedRecipe.difficulty}</span>}
+                </div>
+
+                {selectedRecipe.madeDates?.length > 0 && (
+                  <div style={{ marginBottom: 20 }}>
+                    <div style={{ fontSize: 13, color: '#7a6045', fontStyle: 'italic', marginBottom: 6 }}>Made on:</div>
+                    <div className="made-dates">
+                      {selectedRecipe.madeDates.map((d, i) => <span key={i} className="made-date-tag">{d}</span>)}
+                    </div>
+                  </div>
+                )}
+
+                <hr className="section-divider" />
+
+                {/* Notes */}
+                <div>
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
+                    <div className="notes-section-title">My Notes</div>
+                    {!editingNotes && (
+                      <button className="btn-secondary" onClick={() => {
+                        setNoteDraft(selectedRecipe.notes || '');
+                        setDifficultyDraft(selectedRecipe.difficulty || '');
+                        setEditingNotes(true);
+                      }}>
+                        {selectedRecipe.notes ? 'Edit' : '+ Add Notes'}
+                      </button>
+                    )}
+                  </div>
+
+                  {editingNotes ? (
+                    <div>
+                      <div style={{ marginBottom: 10 }}>
+                        <label style={{ fontSize: 14, color: '#7a6045', fontStyle: 'italic', display: 'block', marginBottom: 6 }}>Difficulty</label>
+                        <select className="difficulty-select" value={difficultyDraft} onChange={e => setDifficultyDraft(e.target.value)}>
+                          <option value="">— Not set —</option>
+                          <option>Easy</option><option>Medium</option><option>Hard</option><option>Weekend Project</option>
+                        </select>
+                      </div>
+                      <textarea
+                        className="notes-textarea"
+                        value={noteDraft}
+                        onChange={e => setNoteDraft(e.target.value)}
+                        placeholder="Substitutions, tips, what I changed, who loved it…"
+                      />
+                      <div style={{ display: 'flex', gap: 8, marginTop: 10 }}>
+                        <button className="btn-primary" style={{ width: 'auto', padding: '9px 22px' }} onClick={saveNotes}>Save Notes</button>
+                        <button className="btn-secondary" onClick={() => setEditingNotes(false)}>Cancel</button>
+                      </div>
+                    </div>
+                  ) : (
+                    <div className="notes-display">
+                      {selectedRecipe.notes || <span style={{ color: '#b0a090', fontStyle: 'italic' }}>No notes yet. Add your thoughts, substitutions, or tips.</span>}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
+        {/* ── ADD BOOK VIEW ─────────────────────────────────────────── */}
+        {view === 'add' && (
+          <div className="content">
+            <div className="add-panel">
+              <div className="add-title">Add a Cookbook</div>
+              <div className="add-sub">Scan or type the ISBN from the back cover</div>
+              <input
+                className="isbn-input"
+                placeholder="e.g. 9780385354233"
+                value={isbnInput}
+                onChange={e => setIsbnInput(e.target.value)}
+                onKeyDown={e => e.key === 'Enter' && handleAddBook()}
+                disabled={addStatus === 'fetching' || addStatus === 'extracting'}
+                inputMode="numeric"
+                type="text"
+              />
+              <button
+                className="btn-primary"
+                onClick={handleAddBook}
+                disabled={!isbnInput.trim() || addStatus === 'fetching' || addStatus === 'extracting'}
+              >
+                {(addStatus === 'fetching' || addStatus === 'extracting')
+                  ? <><Spinner />Working…</>
+                  : 'Add to My Library'}
+              </button>
+
+              {addMessage && (
+                <div className={`status-msg ${addStatus}`}>
+                  {(addStatus === 'fetching' || addStatus === 'extracting') && <Spinner />}
+                  <span>{addMessage}</span>
+                </div>
+              )}
+
+              {library.books.length > 0 && (
+                <div style={{ marginTop: 32 }}>
+                  <hr className="section-divider" />
+                  <div className="section-header">
+                    <div className="section-title">Your Library ({library.books.length})</div>
+                  </div>
+                  <div className="library-grid">
+                    {library.books.map(book => (
+                      <div key={book.id}>
+                        <div className="library-book-card" onClick={() => { setFilterBook(book.id); setView('search'); }}>
+                          <BookCover book={book} size={90} />
+                          <div className="library-book-title">{book.title}</div>
+                          <div className="library-book-author">{book.author}</div>
+                          <div className="library-book-count">{library.recipes.filter(r => r.bookId === book.id).length} recipes</div>
+                        </div>
+                        <button className="btn-danger" style={{ marginTop: 6, width: '100%', fontSize: 12, padding: '4px 0' }} onClick={() => deleteBook(book.id)}>Remove</button>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* ── SEARCH VIEW ───────────────────────────────────────────── */}
+        {view === 'search' && (
+          <div className="content">
+            <div className="search-hero">
+              <div className="search-title">Your Recipe Library</div>
+              <div className="search-sub">Search across every cookbook on your shelf</div>
+              <div className="search-bar-wrap">
+                <input
+                  className="search-bar"
+                  placeholder="chocolate chip cookies, risotto, lemon tart…"
+                  value={searchQuery}
+                  onChange={e => setSearchQuery(e.target.value)}
+                />
+                <span className="search-icon">🔍</span>
+              </div>
+            </div>
+
+            {library.books.length > 0 && (
+              <div className="stats-bar">
+                {[
+                  { num: library.books.length, label: 'cookbooks' },
+                  { num: library.recipes.length, label: 'recipes indexed' },
+                  { num: library.recipes.filter(r => r.rating > 0).length, label: 'recipes rated' },
+                  { num: library.recipes.filter(r => r.madeDates?.length > 0).length, label: 'recipes made' },
+                ].map(s => (
+                  <div key={s.label} className="stat-item">
+                    <div className="stat-num">{s.num}</div>
+                    <div className="stat-label">{s.label}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {library.recipes.length > 0 && (
+              <div className="filters">
+                <span className="filter-label">Category:</span>
+                {categories.map(cat => (
+                  <button key={cat} className={`filter-chip ${filterCategory === cat ? 'active' : ''}`} onClick={() => setFilterCategory(cat)}>{cat}</button>
+                ))}
+                {library.books.length > 1 && (
+                  <>
+                    <span className="filter-label" style={{ marginLeft: 6 }}>Book:</span>
+                    <select className="filter-select" value={filterBook} onChange={e => setFilterBook(e.target.value)}>
+                      <option value="All">All Books</option>
+                      {library.books.map(b => <option key={b.id} value={b.id}>{b.title}</option>)}
+                    </select>
+                  </>
+                )}
+                {(filterBook !== 'All' || filterCategory !== 'All') && (
+                  <button className="filter-chip" onClick={() => { setFilterBook('All'); setFilterCategory('All'); }}>✕ Clear</button>
+                )}
+              </div>
+            )}
+
+            {library.recipes.length === 0 ? (
+              <div className="empty-state">
+                <div className="empty-icon">📖</div>
+                <div className="empty-title">Your shelf is empty</div>
+                <div className="empty-sub">Add your first cookbook to get started</div>
+                <button className="btn-primary" style={{ width: 'auto', marginTop: 20, padding: '12px 28px' }} onClick={() => setView('add')}>
+                  + Add a Cookbook
+                </button>
+              </div>
+            ) : results.length === 0 ? (
+              <div className="empty-state">
+                <div className="empty-icon">🔍</div>
+                <div className="empty-title">No recipes found</div>
+                <div className="empty-sub">Try a different search or clear your filters</div>
+              </div>
+            ) : (
+              <>
+                <div className="results-count">
+                  {debouncedQuery ? `${results.length} recipe${results.length !== 1 ? 's' : ''} matching "${debouncedQuery}"` : `${results.length} recipe${results.length !== 1 ? 's' : ''}`}
+                </div>
+                <div className="results-grid">
+                  {results.map(recipe => {
+                    const book = getBook(recipe.bookId);
+                    return (
+                      <div key={recipe.id} className="recipe-card" onClick={() => { setSelectedRecipe(recipe); setView('detail'); }}>
+                        {book && <BookCover book={book} size={50} />}
+                        <div className="recipe-card-body">
+                          <div className="recipe-name">{recipe.name}</div>
+                          <div className="recipe-desc">{recipe.description}</div>
+                          <div className="recipe-meta">
+                            {book && <span className="recipe-book">{book.title}</span>}
+                            <span className="recipe-page">p.{recipe.page}</span>
+                            <span className="recipe-category">{recipe.category}</span>
+                            {recipe.rating > 0 && <span style={{ fontSize: 12, color: '#c8753a' }}>{'★'.repeat(recipe.rating)}</span>}
+                          </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </>
+            )}
+          </div>
+        )}
+
+        {/* Install banner */}
+        {showInstallBanner && installPrompt && (
+          <InstallBanner
+            onInstall={() => { install(); setShowInstallBanner(false); }}
+            onDismiss={() => setShowInstallBanner(false)}
+          />
+        )}
+      </div>
+    </>
+  );
+}
+
+// Mount
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(React.createElement(App));
+  </script>
+</body>
+</html>
